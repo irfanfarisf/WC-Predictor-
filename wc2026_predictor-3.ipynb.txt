@@ -1,0 +1,287 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "bc39b690",
+   "metadata": {},
+   "source": [
+    "# WC 2026 Knockout Predictor\n",
+    "\n",
+    "A lightweight strength-rating + Poisson goal-simulation model for predicting\n",
+    "all 16 knockout matches (Round of 16 -> Final) of the 2026 FIFA World Cup.\n",
+    "\n",
+    "**Method**\n",
+    "1. Assign each team an Elo-style strength rating (0-100), based on current tournament form, squad quality, and historical pedigree.\n",
+    "2. Convert the rating gap between two teams into expected goals (lambda) for each side.\n",
+    "3. Sample a scoreline from independent Poisson distributions for each team's expected goals.\n",
+    "4. If simulated scores tie, nudge the higher-rated team's score up by one (no draws allowed in a knockout).\n",
+    "5. Propagate winners through the fixed FIFA bracket: R32 (undecided fixtures only) -> R16 -> QF -> SF -> 3rd place -> Final.\n",
+    "6. Assign goal scorers by sampling from each team's known key attacking players.\n",
+    "\n",
+    "**Caveat**: this is a fun heuristic model for a prediction leaderboard, not a\n",
+    "serious forecasting system. Exact scorelines and scorers are inherently\n",
+    "high-variance and no model reliably beats chance on those columns."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "38099bbc",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import random, csv\n",
+    "\n",
+    "random.seed(42)  # change this to explore different simulated outcomes\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "87d2d298",
+   "metadata": {},
+   "source": [
+    "## 1. Team strength ratings\n",
+    "Subjective 0-100 scale reflecting current 2026 tournament form and pedigree."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "a375318d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ratings = {\n",
+    "    \"CAN\": 66, \"MAR\": 81, \"PAR\": 68, \"FRA\": 95,\n",
+    "    \"BRA\": 91, \"NOR\": 84, \"MEX\": 81, \"ENG\": 90,\n",
+    "    \"BEL\": 82, \"SEN\": 76, \"USA\": 80, \"BIH\": 68,\n",
+    "    \"ESP\": 90, \"AUT\": 75, \"SUI\": 76, \"ALG\": 71,\n",
+    "    \"POR\": 88, \"CRO\": 80, \"ARG\": 97, \"CPV\": 62,\n",
+    "    \"AUS\": 65, \"EGY\": 73, \"COL\": 78, \"GHA\": 70,\n",
+    "}\n",
+    "\n",
+    "names = {\n",
+    "    \"CAN\":\"Canada\",\"MAR\":\"Morocco\",\"PAR\":\"Paraguay\",\"FRA\":\"France\",\"BRA\":\"Brazil\",\"NOR\":\"Norway\",\n",
+    "    \"MEX\":\"Mexico\",\"ENG\":\"England\",\"BEL\":\"Belgium\",\"SEN\":\"Senegal\",\"USA\":\"USA\",\"BIH\":\"Bosnia and Herzegovina\",\n",
+    "    \"ESP\":\"Spain\",\"AUT\":\"Austria\",\"SUI\":\"Switzerland\",\"ALG\":\"Algeria\",\"POR\":\"Portugal\",\"CRO\":\"Croatia\",\n",
+    "    \"ARG\":\"Argentina\",\"CPV\":\"Cabo Verde\",\"AUS\":\"Australia\",\"EGY\":\"Egypt\",\"COL\":\"Colombia\",\"GHA\":\"Ghana\",\n",
+    "}\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "8dce7c7d",
+   "metadata": {},
+   "source": [
+    "## 2. Key scorers per team\n",
+    "Used to sample plausible goal-scorer sets (jersey numbers)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "c52c9a7c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "scorers = {\n",
+    "    \"ARG\": [(10,\"Messi\"),(9,\"J.Alvarez\"),(22,\"Lautaro\")],\n",
+    "    \"FRA\": [(10,\"Mbappe\"),(11,\"Dembele\"),(9,\"Kolo Muani\")],\n",
+    "    \"BRA\": [(7,\"Vinicius Jr\"),(11,\"Rodrygo\"),(9,\"Richarlison\")],\n",
+    "    \"ENG\": [(9,\"Kane\"),(7,\"Saka\"),(10,\"Foden\")],\n",
+    "    \"ESP\": [(19,\"Yamal\"),(8,\"Pedri\"),(9,\"Morata\")],\n",
+    "    \"POR\": [(7,\"Ronaldo\"),(11,\"B.Fernandes\"),(21,\"Leao\")],\n",
+    "    \"NOR\": [(9,\"Haaland\"),(11,\"Sorloth\"),(7,\"Odegaard\")],\n",
+    "    \"MEX\": [(9,\"R.Jimenez\"),(7,\"Quinones\"),(20,\"Gimenez\")],\n",
+    "    \"MAR\": [(19,\"En-Nesyri\"),(2,\"Hakimi\"),(10,\"Ziyech\")],\n",
+    "    \"BEL\": [(9,\"Lukaku\"),(7,\"De Bruyne\"),(11,\"Doku\")],\n",
+    "    \"USA\": [(10,\"Pulisic\"),(9,\"Balogun\"),(11,\"Weah\")],\n",
+    "    \"CRO\": [(10,\"Modric\"),(9,\"Kramaric\"),(17,\"Budimir\")],\n",
+    "    \"COL\": [(9,\"Diaz\"),(11,\"Cordoba\"),(20,\"J.Rodriguez\")],\n",
+    "    \"SUI\": [(10,\"Xhaka\"),(9,\"Embolo\"),(7,\"Ndoye\")],\n",
+    "    \"SEN\": [(9,\"Sarr\"),(19,\"N.Jackson\"),(10,\"Diatta\")],\n",
+    "    \"EGY\": [(7,\"M.Salah\"),(9,\"Zizo\"),(20,\"Marmoush\")],\n",
+    "    \"PAR\": [(9,\"Alderete\"),(11,\"Almiron\"),(7,\"Enciso\")],\n",
+    "    \"CAN\": [(17,\"David\"),(10,\"Buchanan\"),(23,\"Larin\")],\n",
+    "    \"AUT\": [(9,\"Gregoritsch\"),(10,\"Sabitzer\"),(19,\"Schmid\")],\n",
+    "    \"ALG\": [(19,\"Mahrez\"),(9,\"Delort\"),(11,\"Bounedjah\")],\n",
+    "    \"AUS\": [(9,\"Duke\"),(19,\"Irvine\"),(7,\"Metcalfe\")],\n",
+    "    \"CPV\": [(9,\"W.Semedo\"),(10,\"R.Mendes\"),(7,\"Stopira\")],\n",
+    "    \"GHA\": [(10,\"Kudus\"),(9,\"Semenyo\"),(19,\"Ayew\")],\n",
+    "    \"BIH\": [(17,\"Dzeko\"),(10,\"Pjanic Jr\"),(9,\"Demirovic\")],\n",
+    "}\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1056fd70",
+   "metadata": {},
+   "source": [
+    "## 3. Poisson goal-simulation engine"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "61e64673",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def poisson(lam):\n",
+    "    L = pow(2.71828182846, -lam)\n",
+    "    k, p = 0, 1\n",
+    "    while True:\n",
+    "        k += 1\n",
+    "        p *= random.random()\n",
+    "        if p <= L:\n",
+    "            return k - 1\n",
+    "\n",
+    "def sim_score(a, b):\n",
+    "    diff = ratings[a] - ratings[b]\n",
+    "    lam_a = max(0.4, 1.35 + diff/45)\n",
+    "    lam_b = max(0.4, 1.15 - diff/45)\n",
+    "    ga = min(5, poisson(lam_a))\n",
+    "    gb = min(5, poisson(lam_b))\n",
+    "    if ga == gb:\n",
+    "        if ratings[a] >= ratings[b]:\n",
+    "            ga += 1\n",
+    "        else:\n",
+    "            gb += 1\n",
+    "    return ga, gb\n",
+    "\n",
+    "def pick_scorers(team, goals):\n",
+    "    pool = scorers.get(team, [(9,\"Fwd\"),(10,\"Mid\"),(7,\"Wing\")])\n",
+    "    chosen = random.sample(pool, min(goals, len(pool)))\n",
+    "    extra = goals - len(chosen)\n",
+    "    nums = [str(n) for n,_ in chosen]\n",
+    "    while extra > 0:\n",
+    "        nums.append(str(pool[0][0]))\n",
+    "        extra -= 1\n",
+    "    return \";\".join(nums) if goals > 0 else \"\"\n",
+    "\n",
+    "def play(a, b):\n",
+    "    ga, gb = sim_score(a, b)\n",
+    "    winner = a if ga > gb else b\n",
+    "    return ga, gb, winner\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "9aa06dd3",
+   "metadata": {},
+   "source": [
+    "## 4. Bracket structure\n",
+    "\n",
+    "As of prediction time, Round of 32 has 8 matches still to be played\n",
+    "(Belgium-Senegal through Colombia-Ghana). Those are simulated here to seed\n",
+    "the Round of 16; re-run this notebook with the real results once they land\n",
+    "for a more accurate bracket."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1558db7d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "r16_pairs_raw = [\n",
+    "    (\"CAN\",\"MAR\"),\n",
+    "    (\"FRA\",\"PAR\"),\n",
+    "    (\"BRA\",\"NOR\"),\n",
+    "    (\"MEX\",\"ENG\"),\n",
+    "]\n",
+    "\n",
+    "r32_undecided = [\n",
+    "    (\"BEL\",\"SEN\"), (\"USA\",\"BIH\"),\n",
+    "    (\"POR\",\"CRO\"), (\"ESP\",\"AUT\"),\n",
+    "    (\"ARG\",\"CPV\"), (\"AUS\",\"EGY\"),\n",
+    "    (\"SUI\",\"ALG\"), (\"COL\",\"GHA\"),\n",
+    "]\n",
+    "r32_results = {pair: play(*pair) for pair in r32_undecided}\n",
+    "\n",
+    "r16_pairs_raw += [\n",
+    "    (r32_results[(\"BEL\",\"SEN\")][2], r32_results[(\"USA\",\"BIH\")][2]),\n",
+    "    (r32_results[(\"POR\",\"CRO\")][2], r32_results[(\"ESP\",\"AUT\")][2]),\n",
+    "    (r32_results[(\"ARG\",\"CPV\")][2], r32_results[(\"AUS\",\"EGY\")][2]),\n",
+    "    (r32_results[(\"SUI\",\"ALG\")][2], r32_results[(\"COL\",\"GHA\")][2]),\n",
+    "]\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "e2d24aeb",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "results = []\n",
+    "\n",
+    "def add(mid, stage, a, b):\n",
+    "    ga, gb, w = play(a, b)\n",
+    "    results.append({\n",
+    "        \"match_id\": mid, \"stage\": stage, \"home\": a, \"away\": b,\n",
+    "        \"hs\": ga, \"as_\": gb, \"winner\": w,\n",
+    "        \"hsc\": pick_scorers(a, ga), \"asc\": pick_scorers(b, gb)\n",
+    "    })\n",
+    "    return w\n",
+    "\n",
+    "r16_winners = [add(f\"R16_{i:03d}\", \"Round of 16\", a, b) for i, (a, b) in enumerate(r16_pairs_raw, start=1)]\n",
+    "\n",
+    "qf_pairs = [(r16_winners[0],r16_winners[1]), (r16_winners[2],r16_winners[3]),\n",
+    "            (r16_winners[4],r16_winners[5]), (r16_winners[6],r16_winners[7])]\n",
+    "qf_winners, qf_losers = [], []\n",
+    "for i,(a,b) in enumerate(qf_pairs, start=1):\n",
+    "    w = add(f\"QF_{i:03d}\", \"Quarter Final\", a, b)\n",
+    "    qf_winners.append(w)\n",
+    "    r = results[-1]\n",
+    "    qf_losers.append(r[\"home\"] if r[\"winner\"]==r[\"away\"] else r[\"away\"])\n",
+    "\n",
+    "sf_pairs = [(qf_winners[0],qf_winners[1]), (qf_winners[2],qf_winners[3])]\n",
+    "sf_winners, sf_losers = [], []\n",
+    "for i,(a,b) in enumerate(sf_pairs, start=1):\n",
+    "    w = add(f\"SF_{i:03d}\", \"Semi Final\", a, b)\n",
+    "    sf_winners.append(w)\n",
+    "    r = results[-1]\n",
+    "    sf_losers.append(r[\"home\"] if r[\"winner\"]==r[\"away\"] else r[\"away\"])\n",
+    "\n",
+    "add(\"TP_001\", \"Third Place Play-off\", sf_losers[0], sf_losers[1])\n",
+    "champion = add(\"F_001\", \"Final\", sf_winners[0], sf_winners[1])\n",
+    "\n",
+    "print(\"Predicted champion:\", names[champion])\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e09a99df",
+   "metadata": {},
+   "source": [
+    "## 5. Export predictions CSV"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "a8e7b463",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with open(\"mufifa26_predictions.csv\", \"w\", newline=\"\") as f:\n",
+    "    wtr = csv.writer(f)\n",
+    "    wtr.writerow([\"match_id\",\"stage\",\"home_team\",\"away_team\",\"predicted_home_score\",\n",
+    "                  \"predicted_away_score\",\"predicted_scorers_home\",\"predicted_scorers_away\",\n",
+    "                  \"predicted_winner\",\"tournament_champion\"])\n",
+    "    for r in results:\n",
+    "        champ_col = names[champion] if r[\"match_id\"] == \"F_001\" else \"\"\n",
+    "        wtr.writerow([r[\"match_id\"], r[\"stage\"], names[r[\"home\"]], names[r[\"away\"]],\n",
+    "                      r[\"hs\"], r[\"as_\"], r[\"hsc\"], r[\"asc\"], names[r[\"winner\"]], champ_col])\n",
+    "\n",
+    "for r in results:\n",
+    "    print(r[\"match_id\"], names[r[\"home\"]], r[\"hs\"], \"-\", r[\"as_\"], names[r[\"away\"]], \"| Winner:\", names[r[\"winner\"]])\n"
+   ]
+  }
+ ],
+ "metadata": {},
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
